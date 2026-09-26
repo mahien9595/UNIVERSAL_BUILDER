@@ -475,15 +475,18 @@ class NuitkaToolchain:
 class PythonLocator:
     """Tìm python.exe để chạy Nuitka/PyInstaller (bắt buộc khi Control Center đã bị đóng gói thành .exe)."""
 
+    # Mỗi câu lệnh 1 dòng riêng (bản cũ viết "import ...; try:" trên cùng 1 dòng -> SyntaxError,
+    # nên probe() từng bị thay bằng bản giả luôn báo "Đã nhận diện" dù Python CHƯA cài Nuitka).
     PROBE = (
-        "import sys, json, struct; "
-        "try:\n"
-        "    from importlib import metadata\n"
-        "    d = {(dist.metadata.get('Name') or '').lower(): dist.version for dist in metadata.distributions()}\n"
-        "except Exception:\n"
-        "    d = {}\n"
-        "print(json.dumps({'version': '%d.%d.%d' % sys.version_info[:3], 'bits': struct.calcsize('P') * 8, "
-        "'nuitka': d.get('nuitka', ''), 'pyinstaller': d.get('pyinstaller', '')}))"
+        "import sys, json, struct\n"
+        "def ver(name):\n"
+        "    try:\n"
+        "        from importlib import metadata\n"
+        "        return metadata.version(name)\n"
+        "    except Exception:\n"
+        "        return ''\n"
+        "print('@@PY@@' + json.dumps({'version': '%d.%d.%d' % sys.version_info[:3], "
+        "'bits': struct.calcsize('P') * 8, 'nuitka': ver('nuitka'), 'pyinstaller': ver('pyinstaller')}))\n"
     )
 
     def __init__(self, settings: AppConfig):
@@ -551,35 +554,41 @@ class PythonLocator:
         if not os.path.isfile(python_exe):
             return None
             
-        # Kiểm tra nhanh bằng câu lệnh đơn giản, tránh lỗi khoảng trắng đường dẫn
+        # Hỏi CHÍNH python.exe này: phiên bản, số bit và phiên bản Nuitka/PyInstaller THỰC SỰ đã cài.
+        # (Bản trước luôn ghi "Đã nhận diện" -> Python chưa cài Nuitka vẫn qua được kiểm tra, rồi build
+        # lỗi "No module named nuitka"; và không biết đúng phiên bản Nuitka để chọn cờ dòng lệnh.)
         try:
-            cmd = [python_exe, "-c", "import sys, struct; print(f'{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}|{struct.calcsize(\"P\") * 8}')"]
-            r = run_quiet(cmd, timeout=15)
-            if r.returncode == 0 and r.stdout.strip():
-                parts = r.stdout.strip().splitlines()[-1].split('|')
-                ver_str = parts[0]
-                bits_val = int(parts[1]) if len(parts) > 1 else 64
-                
-                # Bỏ qua kiểm tra package nâng cao nếu bị lỗi, mặc định chấp nhận python.exe chuẩn
+            r = run_quiet([python_exe, "-c", self.PROBE], timeout=30)
+            payload = next((ln[6:] for ln in r.stdout.splitlines() if ln.startswith("@@PY@@")), "")
+            if r.returncode == 0 and payload:
+                data = json.loads(payload)
                 return PythonInfo(
                     path=python_exe,
-                    version=ver_str,
-                    bits=bits_val,
-                    nuitka="Đã nhận diện",
-                    pyinstaller="Đã nhận diện"
+                    version=str(data.get("version", "")),
+                    bits=int(data.get("bits", 64)),
+                    nuitka=str(data.get("nuitka") or ""),
+                    pyinstaller=str(data.get("pyinstaller") or ""),
                 )
+            log.info("Probe %s thất bại (mã %s): %s", python_exe, r.returncode, (r.stderr or "")[-300:])
         except Exception as exc:
             log.info("Probe %s thất bại: %s", python_exe, exc)
-            
         return None
 
     def resolve(self) -> Optional[PythonInfo]:
+        """python.exe đã cấu hình (nếu còn chạy được) luôn thắng; nếu không, ưu tiên bản đã cài Nuitka/PyInstaller."""
+        configured = os.path.abspath(self.settings.python_exe) if self.settings.python_exe else ""
+        fallback: Optional[PythonInfo] = None
         for cand in self.candidates():
             info = self.probe(cand)
-            if info:
-                info.msvc = NuitkaToolchain.find_msvc() or ""
-                return info
-        return None
+            if not info:
+                continue
+            if cand == configured or info.nuitka or info.pyinstaller:
+                fallback = info
+                break
+            fallback = fallback or info
+        if fallback:
+            fallback.msvc = NuitkaToolchain.find_msvc() or ""
+        return fallback
 
     def remember(self, path: str) -> tuple[Optional[PythonInfo], str]:
         info = self.probe(path)
@@ -1603,6 +1612,17 @@ class DependencyScanner:
                     mods.add(node.module.split(".")[0])
         return mods
 
+    QT_MODULES: set[str] = {"PyQt5", "PyQt6", "PySide2", "PySide6"}
+    TK_MODULES: set[str] = {"tkinter", "_tkinter", "customtkinter", "ttkbootstrap", "tkinterdnd2", "ttkthemes"}
+
+    @classmethod
+    def qt_only(cls, script_path: str) -> bool:
+        """App giao diện Qt (PySide6/PyQt...) và KHÔNG dùng tkinter ở đâu cả (kể cả file .py phụ)?
+        -> không bật plugin tk-inter: chỉ làm exe nặng thêm Tcl/Tk, và nếu Python build không cài
+        Tcl/Tk thì Nuitka dừng hẳn với 'FATAL: tk-inter: Error, it seems tk-inter is not installed'."""
+        uses, _ = ImportChecker.scan_sources(script_path)
+        return bool(set(uses) & cls.QT_MODULES) and not (set(uses) & cls.TK_MODULES)
+
     @classmethod
     def suggest_nuitka_flags(cls, script_path: str, existing_plugins: set[str]) -> list[str]:
         """Trả về danh sách cờ Nuitka nên thêm (bỏ qua plugin đã có sẵn trong existing_plugins,
@@ -2123,7 +2143,7 @@ class BuildCommandFactory:
         if cfg.clean_build:
             cmd.append("--remove-output")   # TURBO: mặc định TẮT -> giữ .build để Scons/ccache tái dùng
         cmd.append("--lto=yes" if cfg.lto else "--lto=no")
-        if cfg.tk_plugin:
+        if cfg.tk_plugin and not DependencyScanner.qt_only(cfg.script):
             cmd.append("--enable-plugin=tk-inter")
         if major >= 2:
             if cfg.slim_imports:  # ít module phải biên dịch -> nhanh & exe nhỏ hơn
@@ -2846,6 +2866,22 @@ class BuildFailureDiagnostics:
                 f"LTO={'bật' if cfg.lto else 'tắt'}).\n"
                 "Giảm 'Luồng biên dịch C' (vd. một nửa số lõi) hoặc chọn chế độ Cân bằng/Tiết kiệm, "
                 "tắt LTO, đóng bớt ứng dụng nặng rồi build lại."
+            )
+        m = re.search(r"No module named (nuitka|PyInstaller)\b", output, re.I)
+        if m:
+            pkg = "nuitka" if m.group(1).lower() == "nuitka" else "pyinstaller"
+            return (
+                "[CHẨN ĐOÁN]\n"
+                f"Python dùng để build CHƯA cài {m.group(1)}: {cfg.python.path}\n"
+                f"Cài vào đúng Python đó: \"{cfg.python.path}\" -m pip install {pkg}\n"
+                "(hoặc bấm nút 'Cài Nuitka' / 'Cài PyInstaller'), hoặc chọn python.exe khác bằng '🔧 Cấu hình Python'."
+            )
+        if "tk-inter" in lower and "not installed" in lower:
+            return (
+                "[CHẨN ĐOÁN PLUGIN tk-inter]\n"
+                "Đang bật plugin tk-inter nhưng Python build không có Tcl/Tk. Nếu phần mềm KHÔNG dùng tkinter "
+                "(vd giao diện PySide6/PyQt), bỏ tick 'Plugin tk-inter (Nuitka)'; nếu có dùng, cài lại Python "
+                "và tick 'tcl/tk and IDLE'."
             )
         m = re.search(r"failed to locate module '?([\w.]+)'? you asked to include", output, re.I)
         if m:
